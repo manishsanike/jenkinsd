@@ -1,0 +1,93 @@
+//def environmentFileName = ".\\${params.DockerDeploymentFiles}\\image.properties"
+def jobName = currentBuild.fullDisplayName
+choiceArray = ["Accounting-API-Docker","AR-Docker","BFF-Docker","CRM-RestApi-Docker","DIA-Excel-Docker","DIA-WebApi-Docker","DIA-Web-Docker","DIH-ReportEngine-Docker","DIH-SyncEngine-Docker","DIH-WebApi-Docker","DIH-WebApp-Docker","FPM-Service-Docker","Investran-SignalR","RS-Delivery-Docker","RS-Docker","RS-ExportService-Docker","RS-ImportService-Docker","RW-ExcelAddIn-Docker","RW-Export-Docker","RW-Import-Docker","RW-WebApi-Docker","RW-WebServices-Docker" ]
+
+properties([
+    parameters([
+            choice(choices: choiceArray.collect { "$it\n" }.join(''),
+                    description: 'Choose an Apllication',
+                    name: 'DEPLOY_RELEASE')
+    ])
+])
+
+pipeline {
+    agent {
+        label 'master'
+    }
+    options {
+    	buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+    }
+    parameters { 
+      string(name: 'RepositoryURL', defaultValue: 'https://bitbucket.fis.dev/scm/investran/investraninv.git',  description: 'Bitbucket repository URL.')
+      string(name: 'BranchName',  defaultValue: 'feature/investran-36',  description: 'Bitbucket repository branch name.')
+      string(name: 'BitBucketCredential',  defaultValue: '9fa06b24-ae6e-4ca8-87ba-8c4e8c0319dd',  description: 'Bitbucket repository branch name.')
+      string(name: 'DockerEnv',  defaultValue: 'InfinityDEV',  description: 'Docker Environment Name')
+    //  string(name: 'DockerDeploymentFiles',  defaultValue: '.\\docker\\dockerdeployscripts\\Accounting-API-Docker',  description: 'Path of Docker and docker-compose.yaml file')
+    //  string(name: 'ApplicationDir',  defaultValue: 'Accounting-API-Docker',  description: 'Application Directory Name')
+      credentials(
+        credentialType: 'com.cloudbees.plugins.credentials.common.UsernamePasswordCredentials',
+        defaultValue: 'docker-dev-env',
+        description: 'The credentials needed to deploy.',
+        name: 'deployCredentialsId',
+        required: true
+      )
+
+    }                 
+    stages {
+        stage ('Source Code Checkout') {
+            steps {
+	      dir ("${WORKSPACE}") {
+                cleanWs()
+                checkout scm: [$class: 'GitSCM', userRemoteConfigs: [[url: "${params.RepositoryURL}", credentialsId: "${params.BitBucketCredential}"]],
+                branches: [[name: "${params.BranchName}"]]], poll: false
+                   
+                      load ".\\docker\\/${params.DockerEnv}\\/${DEPLOY_RELEASE}\\image.properties"
+                }
+           }
+        }        
+	stage('Modify Docker Deployment') {
+          steps {
+            dir ("${WORKSPACE}") {
+            powershell script:
+            """
+	   (Get-Content -path .\\docker\\$params.DockerEnv\\${DEPLOY_RELEASE}\\docker-compose-base.yml -Raw).replace('\${RepositoryName}', '$env.RepositoryName') | Set-Content -path .\\docker\\$params.DockerEnv\\${DEPLOY_RELEASE}\\docker-compose-base.yml
+            (Get-Content -path .\\docker\\$params.DockerEnv\\${DEPLOY_RELEASE}\\docker-compose-base.yml -Raw).replace('\${ImageVersion}', '$env.image_version') | Set-Content -path .\\docker\\$params.DockerEnv\\${DEPLOY_RELEASE}\\docker-compose-base.yml
+            cat .\\docker\\$params.DockerEnv\\${DEPLOY_RELEASE}\\docker-compose-base.yml
+
+            """
+            }
+          }
+	}
+        stage('Docker Cluster Deployment') {
+          steps {
+            script {
+              def remote = [:]
+                  remote.name = "$env.name"
+                  remote.host = "$env.hostname"
+                  remote.allowAnyHosts = true
+            withCredentials([usernamePassword(credentialsId: '${deployCredentialsId}', 
+              passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                  remote.user = USERNAME
+                  remote.password = PASSWORD
+                // remote.identityFile = JENKINS_PRIVATE_KEY
+            dir ("${WORKSPACE}") {
+	    sshCommand remote: remote, command: "mkdir -p /tmp/$env.ApplicationName"
+            sshPut remote: remote, from: ".\\docker\\${params.DockerEnv}\\${DEPLOY_RELEASE}", into: "/tmp/$env.ApplicationName/"
+	    sshCommand remote: remote, command: "ls -ltrh /tmp/$env.ApplicationName/${DEPLOY_RELEASE}"
+            sshCommand remote: remote, command: "cd /tmp/$env.ApplicationName/${DEPLOY_RELEASE}; dos2unix Docker_Deployment.sh; sh Docker_Deployment.sh $env.RepositoryName:$env.image_version $env.ApplicationName"
+            sshRemove remote: remote, path: "/tmp/$env.ApplicationName"
+              }
+            }
+          }
+        }
+      }
+    }     
+    post { 
+        always {
+	    sleep 5
+	        emailext attachLog: true, body: 'Please find the attachment', mimeType: 'text/plain', subject: "[Jenkins] ${jobName} Report", from: "manish.sanike@fisglobal.com", to: "manish.sanike@fisglobal.com", recipientProviders: [[$class: 'CulpritsRecipientProvider']]
+            cleanWs()
+        }
+    }    
+  }
+
